@@ -1,0 +1,89 @@
+name: Build macOS (Apple Silicon)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/macos.yml"
+      - "src/**"
+      - "src-tauri/**"
+      - "scripts/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".npmrc"
+      - "vite.config.ts"
+      - "index.html"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build HGhub macOS ARM64
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CI: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon runner
+        shell: bash
+        run: |
+          uname -m
+          test "$(uname -m)" = "arm64"
+          xcode-select -p
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: macos-arm64
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build native macOS app and DMG
+        run: pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg
+
+      - name: Verify and package outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          APP="$(find "$ROOT/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          DMG="$(find "$ROOT/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$APP" && test -n "$DMG"
+          echo "macOS app: $APP"
+          echo "macOS DMG: $DMG"
+          file "$APP/Contents/MacOS/"*
+          mkdir -p artifacts
+          cp "$DMG" artifacts/
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "artifacts/HGhub_macOS_ARM64.app.zip"
+          shasum -a 256 artifacts/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-macOS-ARM64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
