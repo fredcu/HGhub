@@ -1,0 +1,112 @@
+name: Signed macOS (Apple Silicon)
+
+# Manual release only. Never silently fall back to unsigned packages.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-macos-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  signed-macos:
+    name: Sign and notarize HGhub ARM64
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CI: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: macos-signed-arm64
+
+      - name: Check signing and notarization credentials
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_BASE64; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Missing required GitHub Actions secret: $key"
+              exit 1
+            fi
+          done
+          echo "All required secrets exist; building with Developer ID + Apple notarization."
+
+      - name: Prepare App Store Connect notarization key
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          umask 077
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D > "$KEY_PATH"
+          test -s "$KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, Developer ID sign, notarize and staple
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg
+
+      - name: Verify signed outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          APP="$(find "$ROOT/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          DMG="$(find "$ROOT/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$APP" && test -n "$DMG"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          CERT_INFO="$(codesign -dv --verbose=4 "$APP" 2>&1)"
+          printf '%s\n' "$CERT_INFO" | grep -q 'Authority=Developer ID Application:'
+          printf '%s\n' "$CERT_INFO" | grep -q 'TeamIdentifier='
+          xcrun stapler validate "$DMG"
+          mkdir -p artifacts
+          cp "$DMG" artifacts/
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "artifacts/HGhub_macOS_ARM64_signed.app.zip"
+          shasum -a 256 artifacts/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-macOS-ARM64-signed-notarized
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
